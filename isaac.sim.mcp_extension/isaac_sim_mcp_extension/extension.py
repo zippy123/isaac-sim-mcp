@@ -351,8 +351,7 @@ class MCPExtension(omni.ext.IExt):
             exec(code,  local_ns)
             
             # Get the result if any
-            # result = local_ns.get("result", None)
-            result = None
+            result = local_ns.get("result", None)
             
             
             return {

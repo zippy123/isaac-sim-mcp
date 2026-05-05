@@ -219,7 +219,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "IsaacSimMCP",
-    description="Isaac Sim integration through the Model Context Protocol",
+    instructions="Isaac Sim integration through the Model Context Protocol",
     lifespan=server_lifespan
 )
 
@@ -445,12 +445,10 @@ simulation_context.stop()
         
         result = isaac.send_command("execute_script", {"code": code})
         print("result: ", result)
-        return result
-        # return f"Code executed successfully: {result.get('result', '')}"
+        return json.dumps(result) if isinstance(result, dict) else str(result)
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
-        # return f"Error executing code: {str(e)}"
-        return {"status": "error", "error": str(e), "message": "Error executing code"}
+        return f"Error executing code: {str(e)}"
                 
 @mcp.prompt()
 def asset_creation_strategy() -> str:
@@ -749,6 +747,273 @@ def transform(
     except Exception as e:
         logger.error(f"Error transforming model: {str(e)}")
         return f"Error transforming model: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# Script-based tools (no extension changes needed — run Python in Isaac Sim)
+# ---------------------------------------------------------------------------
+
+def _run_script(code: str) -> str:
+    """Helper: send a script to Isaac Sim and return the result as a string."""
+    isaac = get_isaac_connection()
+    result = isaac.send_command("execute_script", {"code": code})
+    return json.dumps(result) if isinstance(result, dict) else str(result)
+
+
+# ── Simulation control ────────────────────────────────────────────────────
+
+@mcp.tool()
+def play_simulation(ctx: Context) -> str:
+    """Start (play) the physics simulation."""
+    try:
+        return _run_script("import omni.timeline\nomni.timeline.get_timeline_interface().play()")
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def stop_simulation(ctx: Context) -> str:
+    """Stop the physics simulation and reset to the initial state."""
+    try:
+        return _run_script("import omni.timeline\nomni.timeline.get_timeline_interface().stop()")
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def pause_simulation(ctx: Context) -> str:
+    """Pause the running physics simulation."""
+    try:
+        return _run_script("import omni.timeline\nomni.timeline.get_timeline_interface().pause()")
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def step_simulation(ctx: Context, num_steps: int = 1) -> str:
+    """Step the physics simulation forward by a number of frames.
+
+    Args:
+        num_steps: Number of physics steps to advance (default 1).
+    """
+    try:
+        code = f"""
+import omni.timeline
+tl = omni.timeline.get_timeline_interface()
+if not tl.is_playing():
+    tl.play()
+for _ in range({num_steps}):
+    import omni.kit.app
+    omni.kit.app.get_app().update()
+result = {{'stepped': {num_steps}}}
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def get_simulation_state(ctx: Context) -> str:
+    """Get the current simulation state (playing, paused, stopped)."""
+    try:
+        code = """
+import omni.timeline
+tl = omni.timeline.get_timeline_interface()
+if tl.is_playing():
+    state = 'playing'
+elif tl.is_stopped():
+    state = 'stopped'
+else:
+    state = 'paused'
+result = {'state': state, 'current_time': tl.get_current_time()}
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── Scene inspection ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_prims(ctx: Context, root_path: str = "/World") -> str:
+    """List all prims under a given path with their types and positions.
+
+    Args:
+        root_path: USD path to start traversal from (default "/World").
+    """
+    try:
+        code = f"""
+import omni.usd, json
+from pxr import UsdGeom, Usd
+stage = omni.usd.get_context().get_stage()
+root = stage.GetPrimAtPath('{root_path}')
+scene = []
+if root.IsValid():
+    for prim in Usd.PrimRange(root):
+        entry = {{'path': str(prim.GetPath()), 'type': prim.GetTypeName()}}
+        if prim.IsA(UsdGeom.Xformable):
+            xf = UsdGeom.Xformable(prim)
+            m = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            p = m.ExtractTranslation()
+            entry['position'] = [round(p[0],2), round(p[1],2), round(p[2],2)]
+        scene.append(entry)
+result = json.dumps(scene, indent=2)
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def get_prim_info(ctx: Context, prim_path: str) -> str:
+    """Get detailed information about a specific prim including attributes, transform, and children.
+
+    Args:
+        prim_path: Full USD path to the prim (e.g. "/World/Cube").
+    """
+    try:
+        code = f"""
+import omni.usd, json
+from pxr import UsdGeom, Usd, Gf
+stage = omni.usd.get_context().get_stage()
+prim = stage.GetPrimAtPath('{prim_path}')
+if not prim.IsValid():
+    result = json.dumps({{'error': 'Prim not found: {prim_path}'}})
+else:
+    info = {{
+        'path': str(prim.GetPath()),
+        'type': prim.GetTypeName(),
+        'children': [str(c.GetPath()) for c in prim.GetChildren()],
+    }}
+    if prim.IsA(UsdGeom.Xformable):
+        xf = UsdGeom.Xformable(prim)
+        m = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        p = m.ExtractTranslation()
+        info['world_position'] = [round(p[0],2), round(p[1],2), round(p[2],2)]
+    attrs = {{}}
+    for a in prim.GetAttributes():
+        v = a.Get()
+        if v is not None:
+            try:
+                json.dumps(v)
+                attrs[a.GetName()] = v
+            except (TypeError, ValueError):
+                attrs[a.GetName()] = str(v)
+    info['attributes'] = attrs
+    result = json.dumps(info, indent=2, default=str)
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── Scene management ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def clear_scene(ctx: Context) -> str:
+    """Create a new empty stage, clearing everything."""
+    try:
+        code = """
+import omni.usd
+omni.usd.get_context().new_stage()
+result = 'New empty stage created'
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+@mcp.tool()
+def delete_prim(ctx: Context, prim_path: str) -> str:
+    """Delete a prim from the stage.
+
+    Args:
+        prim_path: USD path of the prim to delete (e.g. "/World/Cube").
+    """
+    try:
+        code = f"""
+import omni.usd
+stage = omni.usd.get_context().get_stage()
+prim = stage.GetPrimAtPath('{prim_path}')
+if prim.IsValid():
+    stage.RemovePrim('{prim_path}')
+    result = 'Deleted {prim_path}'
+else:
+    result = 'Prim not found: {prim_path}'
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── Lighting ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_light(
+    ctx: Context,
+    light_type: str = "DistantLight",
+    prim_path: str = "/World/Light",
+    intensity: float = 1000.0,
+    color: List[float] = [1.0, 1.0, 1.0]
+) -> str:
+    """Create a light in the scene.
+
+    Args:
+        light_type: One of DistantLight, SphereLight, DomeLight, RectLight, DiskLight, CylinderLight.
+        prim_path: Where to place the light in the USD hierarchy.
+        intensity: Light intensity.
+        color: RGB color as [r, g, b] floats 0-1.
+    """
+    try:
+        code = f"""
+import omni.usd
+from pxr import UsdLux, Gf
+stage = omni.usd.get_context().get_stage()
+light_cls = getattr(UsdLux, '{light_type}', None)
+if light_cls is None:
+    result = 'Unknown light type: {light_type}'
+else:
+    light = light_cls.Define(stage, '{prim_path}')
+    light.GetIntensityAttr().Set({intensity})
+    light.GetColorAttr().Set(Gf.Vec3f({color[0]}, {color[1]}, {color[2]}))
+    result = 'Created {light_type} at {prim_path} with intensity {intensity}'
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── Object creation ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_object(
+    ctx: Context,
+    object_type: str = "Cube",
+    prim_path: str = "/World/Object",
+    position: List[float] = [0, 0, 0],
+    scale: List[float] = [1, 1, 1]
+) -> str:
+    """Create a basic geometric primitive in the scene.
+
+    Args:
+        object_type: Cube, Sphere, Cylinder, Cone, Plane, or Capsule.
+        prim_path: USD path for the new object.
+        position: Position [x, y, z].
+        scale: Scale [x, y, z].
+    """
+    try:
+        code = f"""
+import omni.usd
+from pxr import UsdGeom, Gf
+stage = omni.usd.get_context().get_stage()
+geom_cls = getattr(UsdGeom, '{object_type}', None)
+if geom_cls is None:
+    result = 'Unknown type: {object_type}'
+else:
+    prim = geom_cls.Define(stage, '{prim_path}')
+    xf = UsdGeom.Xformable(prim.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d({position[0]}, {position[1]}, {position[2]}))
+    xf.AddScaleOp().Set(Gf.Vec3d({scale[0]}, {scale[1]}, {scale[2]}))
+    result = 'Created {object_type} at {prim_path}'
+"""
+        return _run_script(code)
+    except Exception as e:
+        return f"Error: {e}"
+
 
 # Main execution
 
