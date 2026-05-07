@@ -1,3 +1,7 @@
+# What's in .bat file to launch
+@echo off
+"%LOCALAPPDATA%\ov\pkg\isaacsim\isaac-sim.bat" --ext-folder "C:\Users\holde\Documents\isaac-sim-mcp" --enable isaac.sim.mcp_extension
+
 # Isaac Sim MCP Extension and MCP Server
 
 The MCP Server and its extension leverage the Model Context Protocol (MCP) framework to enable natural language control of NVIDIA Isaac Sim, transforming conversational AI inputs into precise simulation manipulation. This expansion bridges the MCP ecosystem with embodied intelligence applications.
